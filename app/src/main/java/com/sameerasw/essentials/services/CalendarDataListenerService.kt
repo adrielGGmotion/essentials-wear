@@ -3,11 +3,13 @@ package com.sameerasw.essentials.services
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.util.Log
 import androidx.wear.tiles.TileService
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.os.Build
+import android.os.SystemClock
 import android.provider.Settings
 import com.google.android.gms.wearable.DataEvent
 import com.google.android.gms.wearable.DataEventBuffer
@@ -27,6 +29,16 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 class CalendarDataListenerService : WearableListenerService() {
+    private val notificationAlertPolicy = NotificationAlertPolicy()
+    private var notificationAlertHistoryLoaded = false
+    private val notificationAlertBootCount: Int by lazy {
+        try {
+            Settings.Global.getInt(contentResolver, Settings.Global.BOOT_COUNT, -1)
+        } catch (_: Exception) {
+            -1
+        }
+    }
+
     companion object {
         private const val TAG = "CalendarDataListener"
         private const val SYNC_PATH = "/calendar_events"
@@ -542,11 +554,22 @@ class CalendarDataListenerService : WearableListenerService() {
         }
     }
 
+    @Synchronized
     private fun handleActiveNotificationsSync(activeArrayJson: String) {
         try {
             val activeArray = org.json.JSONArray(activeArrayJson)
             val prefs = getSharedPreferences("schedule_prefs", MODE_PRIVATE)
-            prefs.edit().putString("watch_notifications_json", activeArray.toString()).apply()
+            loadNotificationAlertHistory(prefs)
+            notificationAlertPolicy.replaceHistory(
+                (0 until activeArray.length()).map { activeArray.getJSONObject(it) }
+                    .sortedByDescending { it.optLong("postTime") }
+                    .map { notificationAlertState(it) }
+            )
+            notificationAlertHistoryLoaded = true
+            prefs.edit()
+                .putString("watch_notifications_json", activeArray.toString())
+                .putString("watch_notification_alert_history_json", notificationAlertHistoryJson())
+                .apply()
             val intent = Intent("com.sameerasw.essentials.NOTIFICATIONS_UPDATED").apply {
                 setPackage(packageName)
             }
@@ -556,6 +579,7 @@ class CalendarDataListenerService : WearableListenerService() {
         }
     }
 
+    @Synchronized
     private fun handleNotificationPosted(newNotifJson: String) {
         try {
             val prefs = getSharedPreferences("schedule_prefs", MODE_PRIVATE)
@@ -563,6 +587,11 @@ class CalendarDataListenerService : WearableListenerService() {
             val jsonArray = org.json.JSONArray(existingJson)
             val newObj = org.json.JSONObject(newNotifJson)
             val newKey = newObj.optString("key")
+            if (newKey.isBlank()) return
+            loadNotificationAlertHistory(prefs)
+            val shouldAlert = notificationAlertPolicy.onPosted(
+                notificationAlertState(newObj), SystemClock.elapsedRealtime()
+            )
 
             val updatedArray = org.json.JSONArray()
             updatedArray.put(newObj) // Insert new notification at top
@@ -574,39 +603,32 @@ class CalendarDataListenerService : WearableListenerService() {
                 }
             }
 
-            prefs.edit().putString("watch_notifications_json", updatedArray.toString()).apply()
-            
-            val isMedia = newObj.optBoolean("isMedia", false)
-            if (!isMedia) {
+            prefs.edit()
+                .putString("watch_notifications_json", updatedArray.toString())
+                .putString("watch_notification_alert_history_json", notificationAlertHistoryJson())
+                .putLong("watch_notification_last_alert_elapsed", notificationAlertPolicy.lastAlertTime() ?: -1L)
+                .putInt("watch_notification_last_alert_boot", notificationAlertBootCount)
+                .apply()
+
+            val overlayEnabled = prefs.getBoolean("prefs_notification_overlay_enabled", true)
+            val defaultLauncher = isDefaultLauncher()
+            // Refresh the list for every update, including silent progress and media events.
+            sendBroadcast(Intent("com.sameerasw.essentials.NOTIFICATIONS_UPDATED").apply {
+                setPackage(packageName)
+                if (shouldAlert && overlayEnabled && defaultLauncher) {
+                    putExtra("new_notification_json", newNotifJson)
+                }
+            })
+
+            if (shouldAlert) {
                 SoundUtil.playNotificationSound(this)
                 HapticUtil.performStrongDoubleTap(this)
-
-                val overlayEnabled = prefs.getBoolean("prefs_notification_overlay_enabled", true)
-                if (overlayEnabled) {
-                    if (isDefaultLauncher()) {
-                        Log.d(TAG, "isDefaultLauncher: true - sending broadcast")
-                        val intent = Intent("com.sameerasw.essentials.NOTIFICATIONS_UPDATED").apply {
-                            setPackage(packageName)
-                            putExtra("new_notification_json", newNotifJson)
-                        }
-                        sendBroadcast(intent)
-                    } else {
-                        Log.d(TAG, "isDefaultLauncher: false - showing accessibility overlay")
-                        autoEnableAccessibilityService()
-                        val intent = Intent("com.sameerasw.essentials.SHOW_OVERLAY").apply {
-                            setPackage(packageName)
-                            putExtra("notification_json", newNotifJson)
-                        }
-                        sendBroadcast(intent)
-                    }
-                } else {
-                    // Even if overlay is disabled, we still need to refresh the notification list if launcher is active
-                    if (isDefaultLauncher()) {
-                        val intent = Intent("com.sameerasw.essentials.NOTIFICATIONS_UPDATED").apply {
-                            setPackage(packageName)
-                        }
-                        sendBroadcast(intent)
-                    }
+                if (overlayEnabled && !defaultLauncher) {
+                    autoEnableAccessibilityService()
+                    sendBroadcast(Intent("com.sameerasw.essentials.SHOW_OVERLAY").apply {
+                        setPackage(packageName)
+                        putExtra("notification_json", newNotifJson)
+                    })
                 }
             }
         } catch (e: Exception) {
@@ -614,9 +636,12 @@ class CalendarDataListenerService : WearableListenerService() {
         }
     }
 
+    @Synchronized
     private fun handleNotificationRemoved(keyToRemove: String) {
         try {
             val prefs = getSharedPreferences("schedule_prefs", MODE_PRIVATE)
+            loadNotificationAlertHistory(prefs)
+            notificationAlertPolicy.remove(keyToRemove)
             val existingJson = prefs.getString("watch_notifications_json", "[]") ?: "[]"
             val jsonArray = org.json.JSONArray(existingJson)
             val updatedArray = org.json.JSONArray()
@@ -628,7 +653,10 @@ class CalendarDataListenerService : WearableListenerService() {
                 }
             }
 
-            prefs.edit().putString("watch_notifications_json", updatedArray.toString()).apply()
+            prefs.edit()
+                .putString("watch_notifications_json", updatedArray.toString())
+                .putString("watch_notification_alert_history_json", notificationAlertHistoryJson())
+                .apply()
             val intent = Intent("com.sameerasw.essentials.NOTIFICATIONS_UPDATED").apply {
                 setPackage(packageName)
             }
@@ -636,6 +664,59 @@ class CalendarDataListenerService : WearableListenerService() {
         } catch (e: Exception) {
             Log.e(TAG, "Error removing synced watch notification", e)
         }
+    }
+
+    private fun notificationAlertState(obj: org.json.JSONObject) = NotificationAlertState(
+        key = obj.optString("key"),
+        title = obj.optString("title"),
+        text = obj.optString("text"),
+        messageTime = obj.optLong("messageTime"),
+        isMedia = obj.optBoolean("isMedia", false),
+        isSilent = obj.optBoolean("isSilent", false),
+        isProgress = obj.optBoolean("isProgress", false),
+        onlyAlertOnce = obj.optBoolean("onlyAlertOnce", false),
+        suppressGroupAlert = obj.optBoolean("suppressGroupAlert", false),
+    )
+
+    private fun loadNotificationAlertHistory(prefs: SharedPreferences) {
+        if (notificationAlertHistoryLoaded) return
+        val saved = prefs.getString("watch_notification_alert_history_json", null)
+            ?: prefs.getString("watch_notifications_json", "[]") ?: "[]"
+        val array = try {
+            org.json.JSONArray(saved)
+        } catch (_: Exception) {
+            // Alert history is a cache; a damaged cache must not block a fresh phone sync.
+            try {
+                org.json.JSONArray(prefs.getString("watch_notifications_json", "[]") ?: "[]")
+            } catch (_: Exception) {
+                org.json.JSONArray()
+            }
+        }
+        notificationAlertPolicy.replaceHistory(
+            (0 until array.length()).map { notificationAlertState(array.getJSONObject(it)) }
+        )
+        if (notificationAlertBootCount >= 0 &&
+            prefs.getInt("watch_notification_last_alert_boot", -1) == notificationAlertBootCount
+        ) {
+            notificationAlertPolicy.restoreCooldown(
+                prefs.getLong("watch_notification_last_alert_elapsed", -1L).takeIf { it >= 0L }
+            )
+        }
+        notificationAlertHistoryLoaded = true
+    }
+
+    private fun notificationAlertHistoryJson(): String {
+        val array = org.json.JSONArray()
+        notificationAlertPolicy.snapshot().forEach { item ->
+            // Keep a separate baseline so the 30-row display limit cannot re-alert old keys.
+            array.put(org.json.JSONObject().apply {
+                put("key", item.key)
+                put("title", item.title)
+                put("text", item.text)
+                put("messageTime", item.messageTime)
+            })
+        }
+        return array.toString()
     }
 
     private fun handleAppIconsReceived(jsonStr: String) {
